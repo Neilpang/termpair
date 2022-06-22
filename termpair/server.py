@@ -10,15 +10,19 @@ import logging
 import os
 import time
 from hashlib import md5
-from typing import Any, Dict, List, NamedTuple, NewType, Optional
+from typing import Any, Dict, List, Optional
 
 import starlette  # type: ignore
 from fastapi import FastAPI  # type: ignore
+from fastapi.exceptions import HTTPException  # type: ignore
+from fastapi.middleware.cors import CORSMiddleware  # type:ignore
 from starlette.staticfiles import StaticFiles  # type: ignore
 from starlette.websockets import WebSocket  # type: ignore
 
+from .constants import TERMPAIR_VERSION
+from .server_websocket_subprotocol_handlers import handle_ws_message_subprotocol_v3
+from .Terminal import Terminal, TerminalId
 from .utils import get_random_string
-
 
 PUBLIC_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "frontend_build")
 STATIC_DIR = os.path.join(
@@ -27,20 +31,22 @@ STATIC_DIR = os.path.join(
 
 app = FastAPI()
 
-
-class Terminal(NamedTuple):
-    ws: WebSocket
-    rows: int
-    cols: int
-    web_clients: List[WebSocket]
-    allow_browser_control: bool
-    command: str
-    broadcast_start_time_iso: str
-
-
-TerminalId = NewType("TerminalId", str)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "*",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 terminals: Dict[TerminalId, Terminal] = {}
+
+
+@app.get("/ping")
+async def ping():
+    return "pong"
 
 
 @app.get("/terminal/{terminal_id}")
@@ -53,111 +59,135 @@ async def index(terminal_id: Optional[TerminalId] = None):
 
     data: Dict[str, Any]
 
-    if terminal:
-        rows = terminal.rows
-        cols = terminal.cols
-        allow_browser_control = terminal.allow_browser_control
-        data = dict(
-            terminal_id=terminal_id,
-            cols=cols,
-            rows=rows,
-            allow_browser_control=allow_browser_control,
-            command=terminal.command,
-            broadcast_start_time_iso=terminal.broadcast_start_time_iso,
-            termpair_version=__version__,
-        )
-    else:
-        data = dict(termpair_version=__version__)
+    if not terminal:
+        raise HTTPException(status_code=404, detail="Terminal not found")
+
+    rows = terminal.rows
+    cols = terminal.cols
+    allow_browser_control = terminal.allow_browser_control
+    data = dict(
+        terminal_id=terminal_id,
+        cols=cols,
+        rows=rows,
+        allow_browser_control=allow_browser_control,
+        command=terminal.command,
+        broadcast_start_time_iso=terminal.broadcast_start_time_iso,
+        termpair_version=__version__,
+    )
     return data
 
 
 @app.websocket("/connect_browser_to_terminal")
 async def connect_browser_to_terminal(ws: WebSocket):
-    await ws.accept()
     terminal_id = ws.query_params.get("terminal_id", None)
     terminal = terminals.get(terminal_id)
     if not terminal:
         print(f"terminal id {terminal_id} not found")
         await ws.close()
         return
+    await ws.accept()
 
-    terminal.web_clients.append(ws)
-    num_browsers = len(terminal.web_clients)
+    terminal.browser_websockets.append(ws)
+
+    # Need to create a task so it can be cancelled by the terminal's
+    # task if the terminal session ends. That way, browsers are notified
+    # the session ended instead of thinking the connection is still open
+    # (an exception raised while awaiting)
+    task: asyncio.Task = asyncio.create_task(
+        _task_handle_browser_websocket(terminal, ws)
+    )
+
+    def remove_task_from_terminal_list(future):
+        # task will sit in list as "done"
+        # not a big deal if it sits there, but we'll remove it
+        # immediately since it's never going to be used again
+        terminal.browser_tasks.remove(task)
+
+    task.add_done_callback(remove_task_from_terminal_list)
+    terminal.browser_tasks.append(task)
+    try:
+        # task will be cancelled when terminal session the client started ends
+        await task
+    except asyncio.exceptions.CancelledError:
+        pass
+
+
+async def _task_handle_browser_websocket(terminal: Terminal, ws: WebSocket):
     try:
         # update connected browser count in each browser
-        for browser in terminal.web_clients:
+        num_browsers = len(terminal.browser_websockets)
+        for browser in terminal.browser_websockets:
             await browser.send_json({"event": "num_clients", "payload": num_browsers})
-        # read any input from the browser that just connected
         while True:
-            encrypted_browser_input = await ws.receive_text()
-            if terminal.allow_browser_control:
-                # Got input, send it to the single terminal that's broadcasting.
-                await terminal.ws.send_json(
-                    {"event": "command", "payload": encrypted_browser_input}
-                )
+            await handle_ws_message_subprotocol_v3(ws, terminal)
+
     except starlette.websockets.WebSocketDisconnect:
-        # this can happen when the broadcasting terminal disconnects
-        # and the task reading data from the terminal closes
-        # all connected browser websockets
+        # browser closed the connection
         pass
     finally:
-        terminal.web_clients.remove(ws)
-        num_browsers = len(terminal.web_clients)
-        for web_client in terminal.web_clients:
+        if ws in terminal.browser_websockets:
+            terminal.browser_websockets.remove(ws)
+        num_browsers = len(terminal.browser_websockets)
+        for web_client in terminal.browser_websockets:
             await web_client.send_json(
                 {"event": "num_clients", "payload": num_browsers}
             )
 
 
-async def _task_forward_terminal_data_to_web_clients(terminal: Terminal):
+async def forward_terminal_data_to_web_clients(terminal: Terminal):
     while True:
         # The task is to endlessly wait for new data from the terminal,
         # read it, and broadcast it to all connected browsers
         ws = terminal.ws
-        web_clients = terminal.web_clients
+        browser_websockets = terminal.browser_websockets
         try:
             data = await ws.receive_json()
         except starlette.websockets.WebSocketDisconnect:
-            # Terminal stopped broadcasting
-            for web_client in web_clients:
-                # close each browser connection
-                await web_client.close()
-            # task is done
+            # Terminal stopped broadcasting, close
+            # all browser websocket tasks so they are notified
+            # the connection has actually ended
+            for task in terminal.browser_tasks:
+                task.cancel()
             return
 
-        if data.get("event") == "new_output":
+        terminal_has_closed = False
+        event = data.get("event")
+        if event == "new_output":
             terminal_data = data.get("payload")
-        elif data.get("event") == "resize":
+            terminal_has_closed = not terminal_data
+        elif event == "resize":
             # namedtuples require you to replace fields
             terminal._replace(rows=data["payload"]["rows"])
             terminal._replace(cols=data["payload"]["cols"])
+        elif event in ["aes_keys", "aes_key_rotation"]:
+            pass
         else:
             logging.warning(f"Got unknown event {data.get('event', 'none')}")
 
-        if not terminal_data:
+        if terminal_has_closed:
             # terminal outputs an empty string when it closes, so it just closed
-            for web_client in web_clients:
+            for browser_ws in browser_websockets:
                 # close each browser connection since the terminal's broadcasting
                 # process stopped
-                await web_client.close()
-            # task is done
+                await browser_ws.close()
             return
 
-        clients_to_remove: List[WebSocket] = []
-        for web_client in web_clients:
+        browsers_to_remove: List[WebSocket] = []
+        for browser_ws in browser_websockets:
             try:
-                await web_client.send_json(data)
+                await browser_ws.send_json(data)
             except Exception:
-                if web_client not in clients_to_remove:
-                    clients_to_remove.append(web_client)
+                if browser_ws not in browsers_to_remove:
+                    browsers_to_remove.append(browser_ws)
 
-        if clients_to_remove:
-            for client in clients_to_remove:
-                web_clients.remove(client)
+        if browsers_to_remove:
+            for browser_ws in browsers_to_remove:
+                browser_websockets.remove(browser_ws)
 
-            for web_client in web_clients:
-                await web_client.send_json(
-                    {"event": "num_clients", "payload": len(web_clients)}
+            # let still-connected clients know the new count
+            for browser_ws in browser_websockets:
+                await browser_ws.send_json(
+                    {"event": "num_clients", "payload": len(browser_websockets)}
                 )
         # continue running task in while loop
 
@@ -171,37 +201,45 @@ def _gen_terminal_id(ws: WebSocket) -> TerminalId:
 @app.websocket("/connect_to_terminal")
 async def connect_to_terminal(ws: WebSocket):
     await ws.accept()
-    try:
-        terminal_id = _gen_terminal_id(ws)
-        data = await ws.receive_json()
-        terminal = Terminal(
-            ws=ws,
-            web_clients=[],
-            rows=data["rows"],
-            cols=data["cols"],
-            allow_browser_control=data["allow_browser_control"],
-            command=data["command"],
-            broadcast_start_time_iso=data["broadcast_start_time_iso"],
-        )
-        terminals[terminal_id] = terminal
-
-        # send back to the terminal that the broadcast is starting under
-        # this id
+    data = await ws.receive_json()
+    subprotocol_version = data.get("subprotocol_version")
+    valid_subprotocols = ["3"]
+    if subprotocol_version not in valid_subprotocols:
         await ws.send_text(
-            json.dumps({"event": "start_broadcast", "payload": terminal_id})
+            json.dumps(
+                {
+                    "event": "fatal_error",
+                    "payload": "Client and server are running incompatible versions. "
+                    + f"Server is running v{TERMPAIR_VERSION}. "
+                    + "Ensure you are using a version of the TermPair client compatible with the server. ",
+                }
+            )
         )
+        await ws.close()
+        return
 
-        # start a task that forwards all data from the terminal to browsers
-        task = asyncio.ensure_future(
-            _task_forward_terminal_data_to_web_clients(terminal)
-        )
-        done, pending = await (
-            asyncio.wait([task], return_when=asyncio.FIRST_COMPLETED)
-        )
-        for task in pending:
-            task.cancel()
-    finally:
-        terminals.pop(terminal_id, None)
+    terminal_id = _gen_terminal_id(ws)
+    terminal = Terminal(
+        ws=ws,
+        browser_websockets=[],
+        browser_tasks=[],
+        rows=data["rows"],
+        cols=data["cols"],
+        allow_browser_control=data["allow_browser_control"],
+        command=data["command"],
+        broadcast_start_time_iso=data["broadcast_start_time_iso"],
+        subprotocol_version=subprotocol_version,
+    )
+    terminals[terminal_id] = terminal
+
+    # send back to the terminal that the broadcast is starting under
+    # this id
+    await ws.send_text(json.dumps({"event": "start_broadcast", "payload": terminal_id}))
+
+    # forwards all data from the terminal to browsers for as long as the
+    # client is connected
+    await asyncio.ensure_future(forward_terminal_data_to_web_clients(terminal))
+    terminals.pop(terminal_id, None)
 
 
 app.mount("/", StaticFiles(directory=PUBLIC_DIR, html=True))

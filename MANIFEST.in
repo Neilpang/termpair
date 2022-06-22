@@ -9,6 +9,7 @@ include LICENSE
 prune termpair/frontend_src
 prune docs
 prune tests
+prune .vscode
 
 exclude .flake8
 exclude Dockerfile
@@ -24,3 +25,4 @@ exclude package.json
 exclude termpair_browser.png
 exclude termpair_terminal.png
 exclude yarn.lock
+exclude .pre-commit-config.yaml

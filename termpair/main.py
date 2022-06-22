@@ -4,13 +4,16 @@ import argparse
 import asyncio
 import os
 import shlex
-from urllib.parse import urlparse
 import traceback
-from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware  # type: ignore
-import uvicorn  # type: ignore
-from . import share, server
+from urllib.parse import urlparse
 
-__version__ = "0.1.1.1"
+import uvicorn  # type: ignore
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware  # type: ignore
+
+from . import server, share
+from .constants import TERMPAIR_VERSION, TermPairError
+
+__version__ = TERMPAIR_VERSION
 
 
 def get_parser():
@@ -18,8 +21,8 @@ def get_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="View and control remote terminals from your browser",
     )
-    p.add_argument("--version", action="store_true")
-    subparsers = p.add_subparsers(dest="command")
+    p.add_argument("--version", action="version", version=TERMPAIR_VERSION)
+    subparsers = p.add_subparsers(dest="command", required=True)
 
     share_parser = subparsers.add_parser(
         "share",
@@ -44,10 +47,10 @@ def get_parser():
         "--host", default="http://localhost", help="host server is running on"
     )
     share_parser.add_argument(
-        "--no-browser-control",
-        "-n",
+        "--read-only",
+        "-r",
         action="store_true",
-        help="Do not allow browsers to control your terminal remotely",
+        help="Do not allow browsers to write to the terminal",
     )
     share_parser.add_argument(
         "--open-browser",
@@ -104,17 +107,14 @@ def run_command(args):
         else:
             url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         url = url if url.endswith("/") else f"{url}/"
-        allow_browser_control = not args.no_browser_control
+        allow_browser_control = not args.read_only
         try:
             asyncio.get_event_loop().run_until_complete(
                 share.broadcast_terminal(
                     cmd, url, allow_browser_control, args.open_browser
                 )
             )
-        except ConnectionRefusedError as e:
-            print(
-                "Connection was refused. Is the TermPair server running on the host and port specified?",
-            )
+        except TermPairError as e:
             exit(e)
 
     elif args.command == "serve":
@@ -132,10 +132,6 @@ def run_command(args):
 
 def main():
     args = get_parser().parse_args()
-    if args.version:
-        print(__version__)
-        exit(0)
-
     try:
         run_command(args)
     except Exception:
